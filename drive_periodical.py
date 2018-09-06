@@ -17,7 +17,7 @@ import math
 import numpy as np
 import base64
 import logging
-import shutil
+import time, threading
 
 def logit(msg):
     print("%s" % msg)
@@ -32,7 +32,7 @@ class PID:
         self._max_integral = max_integral
 
         self._set_point    = set_point
-        self._last_time    = last_time if last_time is not None else time()
+        #self._last_time    = last_time if last_time is not None else time()
         self._p_value      = 0.0
         self._i_value      = 0.0
         self._d_value      = 0.0
@@ -111,9 +111,9 @@ class ImageProcessor(object):
         if scale and scale != 1.0:
             img = cv2.resize(img, newsize, interpolation=cv2.INTER_CUBIC) 
 
-        cv2.namedWindow(name, cv2.WINDOW_AUTOSIZE)
-        cv2.imshow(name, img)
-        cv2.waitKey(1)
+        #cv2.namedWindow(name, cv2.WINDOW_AUTOSIZE)
+        #cv2.imshow(name, img)
+        #cv2.waitKey(1)
 
 
     @staticmethod
@@ -136,12 +136,6 @@ class ImageProcessor(object):
     @staticmethod
     def bgr2rgb(img):
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    @staticmethod
-    def getBlackImg(img):
-        lower = np.array([0, 0, 0])
-        upper = np.array([15, 15, 15])
-        return cv2.inRange(img, lower, upper)
 
 
     @staticmethod
@@ -253,101 +247,127 @@ class ImageProcessor(object):
 
     @staticmethod
     def find_steering_angle_by_line(img, last_steering_angle, debug = True):
-        steering_angle_r = 0.0
+        steering_angle = 0.0
         lines          = ImageProcessor.find_lines(img)
 
         if lines is None:
-            return 0.0
+            return steering_angle
 
         image_height = img.shape[0]
         image_width  = img.shape[1]
         camera_x     = image_width / 2
         camera_y     = image_height
-        line_max_y   = image_height/2
-        line_min_x   = image_width/4
-        line_max_x   = image_width *0.75
         vectors      = []
 
-        sum_slope=0
         for line in lines:
             for x1, y1, x2, y2 in line:
-                if y1>line_max_y and y2 >line_max_y: # ignore line in the bottom
-                    continue
-                if x1>line_max_x or x2> line_max_x or x1 <line_min_x or x2<line_min_x:
-                    continue
+                thetaA   = math.atan2(abs(y2 - y1), (x2 - x1))
+                thetaB1  = math.atan2(abs(y1 - camera_y), (x1 - camera_x))
+                thetaB2  = math.atan2(abs(y2 - camera_y), (x2 - camera_x))
+                thetaB   = thetaB1 if abs(np.pi/2 - thetaB1) < abs(np.pi/2 - thetaB2) else thetaB2
 
-                sum_slope= (y2-y1/x2-x1) +sum_slope
-                vectors.append((x1, y1, x2, y2))
-                #todo: check what to do with straight line
+                length   = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+                distance = min(math.sqrt((x1 - camera_x) ** 2 + (y1 - camera_y) ** 2),
+                               math.sqrt((x2 - camera_x) ** 2 + (y2 - camera_y) ** 2))
 
+                vectors.append((distance, length, thetaA, thetaB, (x1, y1, x2, y2)))
 
                 if debug:
-                    # draw the wanted edges in aqua color
+                    # draw the edges
                     cv2.line(img, (x1, y1), (x2, y2), (255, 255, 0), 2)
-        #draw average slopline in olive color
-        if len(vectors)>0:
-            ave_slope = sum_slope/len(vectors)
-            print "ave_slope= " +str(ave_slope)
-            cv2.line(img, (camera_x,camera_y), (camera_x-10*ave_slope, camera_y-10), (0, 126, 126), 2)
-            steering_angle_r = math.atan(ave_slope)
+
+        #the line of the shortest distance and longer length will be the first choice
+        vectors.sort(lambda a, b: cmp(a[0], b[0]) if a[0] != b[0] else -cmp(a[1], b[1]))
+
+        best = vectors[0]
+        best_distance, best_length, best_thetaA, best_thetaB, best_coord = best
+        tolerance = np.pi / 180.0 * 10.0
+
+        best = ImageProcessor._find_best_matched_line(best_thetaA, None, tolerance, vectors, matched = best, start_index = 1)
+        best_distance, best_length, best_thetaA, best_thetaB, best_coord = best
+
+        if debug:
+            #draw the best line
+            cv2.line(img, best_coord[:2], best_coord[2:], (0, 255, 255), 2)
+
+        if abs(best_thetaB - np.pi/2) <= tolerance and abs(best_thetaA - best_thetaB) >= np.pi/4:
+            print "*** sharp turning"
+            best_x1, best_y1, best_x2, best_y2 = best_coord
+            f = lambda x: int(((float(best_y2) - float(best_y1)) / (float(best_x2) - float(best_x1)) * (x - float(best_x1))) + float(best_y1))
+            left_x , left_y  = 0, f(0)
+            right_x, right_y = image_width - 1, f(image_width - 1)
+
+            if left_y < right_y:
+                best_thetaC = math.atan2(abs(left_y - camera_y), (left_x - camera_x))
+
+                if debug:
+                    #draw the last possible line
+                    cv2.line(img, (left_x, left_y), (camera_x, camera_y), (255, 128, 128), 2)
+                    cv2.line(img, (left_x, left_y), (best_x1, best_y1), (255, 128, 128), 2)
+            else:
+                best_thetaC = math.atan2(abs(right_y - camera_y), (right_x - camera_x))
+
+                if debug:
+                    #draw the last possible line
+                    cv2.line(img, (right_x, right_y), (camera_x, camera_y), (255, 128, 128), 2)
+                    cv2.line(img, (right_x, right_y), (best_x1, best_y1), (255, 128, 128), 2)
+
+            steering_angle = best_thetaC
         else:
-            print "no line for average slop"
-        ImageProcessor.show_image(img,"line")
+            steering_angle = best_thetaB
 
-        #steering_angle = math.atan2(image_height, (px - camera_x))
+        if (steering_angle - np.pi/2) * (last_steering_angle - np.pi/2) < 0:
+            last = ImageProcessor._find_best_matched_line(None, last_steering_angle, tolerance, vectors)
 
+            if last:
+                last_distance, last_length, last_thetaA, last_thetaB, last_coord = last
+                steering_angle = last_thetaB
 
-        if False:#debug:
+                if debug:
+                    #draw the last possible line
+                    cv2.line(img, last_coord[:2], last_coord[2:], (255, 128, 128), 2)
+
+        if debug:
             #draw the steering direction
             r = 60
-            x = image_width / 2 + int(r * math.cos(steering_angle_r))
-            y = image_height    - int(r * math.sin(steering_angle_r))
+            x = image_width / 2 + int(r * math.cos(steering_angle))
+            y = image_height    - int(r * math.sin(steering_angle))
             cv2.line(img, (image_width / 2, image_height), (x, y), (255, 0, 255), 2)
+            logit("line angle: %0.2f, steering angle: %0.2f, last steering angle: %0.2f" % (ImageProcessor.rad2deg(best_thetaA), ImageProcessor.rad2deg(np.pi/2-steering_angle), ImageProcessor.rad2deg(np.pi/2-last_steering_angle)))
 
-
-        return ImageProcessor.rad2deg(np.pi/2 - steering_angle_r)
+        return (np.pi/2 - steering_angle)
 
 
     @staticmethod
     def find_steering_angle_by_color(img, last_steering_angle, debug = True):
-        b, g, r      = cv2.split(img)
-        image_height = img.shape[0] #125
-
-        image_width  = img.shape[1] #320
-        camera_x     = image_width / 2 #160
-        image_sample = slice(0, int(image_height * 0.1)) #get the top 1/5 image
+        r, g, b      = cv2.split(img)
+        image_height = img.shape[0]
+        image_width  = img.shape[1]
+        camera_x     = image_width / 2
+        image_sample = slice(0, int(image_height * 0.2))
         sr, sg, sb   = r[image_sample, :], g[image_sample, :], b[image_sample, :]
         track_list   = [sr, sg, sb]
-        tracks       = map(lambda x: len(x[x > 20]), [sr, sg, sb])#calc >20 element
-        tracks_seen  = filter(lambda y: y > 50, tracks) #
-
-        if len(tracks_seen) == 0:
-            return 0.0
-        wall  = ImageProcessor.getBlackImg(img)
-        _wally, _wallx = np.where(wall == 255)
-
-
-        if len(_wallx[_wallx > 20]) >0:
-            wallpx = np.mean(_wallx)
-            cv2.line(wall, (camera_x, image_height), (int(wallpx), 0), (255, 0, 255), 2)
-        ImageProcessor.show_image(wall, "wall")
-
+        tracks       = map(lambda x: len(x[x > 20]), [sr, sg, sb])
+        tracks_seen  = filter(lambda y: y > 50, tracks)
 
         if len(tracks_seen) == 0:
             return 0.0
 
         maximum_color_idx = np.argmax(tracks, axis=None)
-        #maximum_color_idx =1
         _target = track_list[maximum_color_idx]
         _y, _x = np.where(_target == 255)
         px = np.mean(_x)
         steering_angle = math.atan2(image_height, (px - camera_x))
-        angle= 90-ImageProcessor.rad2deg(steering_angle)
-        ImageProcessor.show_image(_target, "_target")
-        cv2.line(img, (camera_x, image_height), (int(px), 0), (255, 0, 255), 2)
-        ImageProcessor.show_image(img, "img")
 
-        return angle * 2.0
+        if debug:
+            #draw the steering direction
+            r = 60
+            x = image_width / 2 + int(r * math.cos(steering_angle))
+            y = image_height    - int(r * math.sin(steering_angle))
+            cv2.line(img, (image_width / 2, image_height), (x, y), (255, 0, 255), 2)
+            #logit("steering angle: %0.2f, last steering angle: %0.2f" % (ImageProcessor.rad2deg(steering_angle), ImageProcessor.rad2deg(np.pi/2-last_steering_angle)))
+
+        return (np.pi/2 - steering_angle) * 2.0
 
 
 class AutoDrive(object):
@@ -361,7 +381,7 @@ class AutoDrive(object):
     THROTTLE_PID_max_integral   = 0.5
     MAX_STEERING_HISTORY        = 3
     MAX_THROTTLE_HISTORY        = 3
-    DEFAULT_SPEED               = 1.0
+    DEFAULT_SPEED               = 0.5
 
     debug = True
 
@@ -378,10 +398,10 @@ class AutoDrive(object):
 
     def on_dashboard(self, src_img, last_steering_angle, speed, throttle, info):
         track_img     = ImageProcessor.preprocess(src_img)
-        #current_angle = ImageProcessor.find_steering_angle_by_color(track_img, last_steering_angle, debug = True)
-        current_angle = ImageProcessor.find_steering_angle_by_line(track_img, last_steering_angle, debug = self.debug)
-        steering_angle = self._steering_pid.update(-current_angle)
-        throttle       = self._throttle_pid.update(speed)
+        current_angle = ImageProcessor.find_steering_angle_by_color(track_img, last_steering_angle, debug = self.debug)
+        #current_angle = ImageProcessor.find_steering_angle_by_line(track_img, last_steering_angle, debug = self.debug)
+        steering_angle = 0 #self._steering_pid.update(-current_angle)
+        throttle       = 0 #self._throttle_pid.update(speed)
 
         if self.debug:
             ImageProcessor.show_image(src_img, "source")
@@ -392,8 +412,9 @@ class AutoDrive(object):
 
         if self._record_folder:
             suffix = "-deg%0.3f" % (ImageProcessor.rad2deg(steering_angle))
-            #ImageProcessor.save_image("bot_log", src_img  , prefix = "cam", suffix = suffix)
-            ImageProcessor.save_image("bot_log", track_img, prefix = "trk", suffix = suffix)
+            ImageProcessor.save_image(self._record_folder, src_img  , prefix = "cam", suffix = suffix)
+            ImageProcessor.save_image(self._record_folder, track_img, prefix = "trk", suffix = suffix)
+
         #smooth the control signals
         self._steering_history.append(steering_angle)
         self._steering_history = self._steering_history[-self.MAX_STEERING_HISTORY:]
@@ -416,10 +437,9 @@ class Car(object):
         self._driver = driver
 
 
-    def on_telemetry(self, dashboard):
+    def on_dashboard(self, dashboard):
         #normalize the units of all parameters
-        #last_steering_angle = np.pi/2 - float(dashboard["steering_angle"]) / 180.0 * np.pi
-        last_steering_angle = float(dashboard["steering_angle"])
+        last_steering_angle = np.pi/2 - float(dashboard["steering_angle"]) / 180.0 * np.pi
         throttle            = float(dashboard["throttle"])
         brake               = float(dashboard["brakes"])
         speed               = float(dashboard["speed"])
@@ -428,11 +448,6 @@ class Car(object):
         print datetime.now(), dashboard;
         total_time = float(dashboard["time"])
         elapsed    = total_time
-
-        #if elapsed >20:
-            #print "elapsed: " +str(elapsed)
-            #send_restart()
-
 
         info = {
             "lap"    : int(dashboard["lap"]) if "lap" in dashboard else 0,
@@ -444,7 +459,7 @@ class Car(object):
 
     def control(self, steering_angle, throttle):
         #convert the values with proper units
-        #steering_angle = min(max(ImageProcessor.rad2deg(steering_angle), -Car.MAX_STEERING_ANGLE), Car.MAX_STEERING_ANGLE)
+        steering_angle = min(max(ImageProcessor.rad2deg(steering_angle), -Car.MAX_STEERING_ANGLE), Car.MAX_STEERING_ANGLE)
         self._control_function(steering_angle, throttle)
 
 
@@ -469,14 +484,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.record:
-        if os.path.exists(args.record):
-            shutil.rmtree(args.record)
-        os.makedirs(args.record)
-
+        if not os.path.exists(args.record):
+            os.makedirs(args.record)
         logit("Start recording images to %s..." % args.record)
 
     sio = socketio.Server()
-    def send_control(steering_angle, throttle):
+    def send_control(steering_angle, throttle):    	  
+        print "dummy"   
+        foo_trigger()     
+        
+    
+    def send_control_real(steering_angle, throttle):    	  
         sio.emit(
             "steer",
             data={
@@ -484,7 +502,8 @@ if __name__ == "__main__":
                 'throttle': str(throttle)
             },
             skip_sid=True)
-        print "send control, steering angle: " + str(steering_angle) + " throttle: " +str (throttle)
+        print "emit control " +str(datetime.now())
+                   
     def send_restart():
         sio.emit(
             "restart",
@@ -493,21 +512,35 @@ if __name__ == "__main__":
 
     car = Car(control_function = send_control)
     drive = AutoDrive(car, args.record)
+    triggered=False
 
     @sio.on('telemetry')
     def telemetry(sid, dashboard):
         if dashboard:
-            car.on_telemetry(dashboard)
+            car.on_dashboard(dashboard)
         else:
             sio.emit('manual', data={}, skip_sid=True)
 
     @sio.on('connect')
     def connect(sid, environ):
         send_restart()
-        car.control(0, 0)
+        foo_trigger()
+        #car.control(0, 0)
 
+    def foo():
+        print(time.ctime())	
+        send_control_real(1,1)
+        threading.Timer(1, foo).start()
+
+    def foo_trigger():
+        global triggered
+        print "trigger periocal call back foo" 
+        if triggered ==False:
+            triggered= True
+            foo()
+		
     app = socketio.Middleware(sio, Flask(__name__))
     eventlet.wsgi.server(eventlet.listen(('', 4567)), app)
-
+    
 # vim: set sw=4 ts=4 et :
 
